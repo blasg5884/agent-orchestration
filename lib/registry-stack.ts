@@ -46,9 +46,22 @@ export class RegistryStack extends cdk.Stack {
     const providerFn = new lambda.Function(this, 'RegistryProviderFn', {
       runtime: lambda.Runtime.PYTHON_3_13,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/registry_provider')),
+      // Bundle the latest boto3 (>=1.42.91) because the AgentCore Agent Registry
+      // preview API is missing from the boto3 version shipped in the Python 3.13
+      // Lambda runtime ('BedrockAgentCoreControlPlaneFrontingLayer' object has no
+      // attribute 'create_registry').
+      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/registry_provider'), {
+        bundling: {
+          image: lambda.Runtime.PYTHON_3_13.bundlingImage,
+          command: [
+            'bash',
+            '-c',
+            'pip install -r requirements.txt -t /asset-output --no-cache-dir && cp -au . /asset-output',
+          ],
+        },
+      }),
       timeout: cdk.Duration.minutes(10),
-      memorySize: 256,
+      memorySize: 512,
       logRetention: logs.RetentionDays.ONE_WEEK,
     });
     providerFn.addToRolePolicy(

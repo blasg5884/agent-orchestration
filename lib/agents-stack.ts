@@ -101,9 +101,19 @@ export class AgentsStack extends cdk.Stack {
     const recordProviderFn = new lambda.Function(this, 'RecordProviderFn', {
       runtime: lambda.Runtime.PYTHON_3_13,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/registry_record_provider')),
+      // Bundle the latest boto3 — see RegistryStack for context.
+      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/registry_record_provider'), {
+        bundling: {
+          image: lambda.Runtime.PYTHON_3_13.bundlingImage,
+          command: [
+            'bash',
+            '-c',
+            'pip install -r requirements.txt -t /asset-output --no-cache-dir && cp -au . /asset-output',
+          ],
+        },
+      }),
       timeout: cdk.Duration.minutes(10),
-      memorySize: 256,
+      memorySize: 512,
       logRetention: logs.RetentionDays.ONE_WEEK,
     });
     recordProviderFn.addToRolePolicy(
