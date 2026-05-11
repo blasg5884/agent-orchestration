@@ -11,92 +11,147 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+import traceback
 from typing import Any
 
 import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from strands import Agent
-from strands_tools.a2a_client import A2AClientToolProvider
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure logging to stdout with force=True so any default handlers from
+# BedrockAgentCoreApp / Strands don't suppress our records. PYTHONUNBUFFERED=1
+# is set in the Dockerfile to ensure prompt flushing.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger("orchestrator")
+logger.setLevel(logging.INFO)
 
 REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
-REGISTRY_ID = os.environ["AGENT_REGISTRY_ID"]
-REGISTRY_ARN = os.environ["AGENT_REGISTRY_ARN"]
+REGISTRY_ID = os.environ.get("AGENT_REGISTRY_ID", "")
+REGISTRY_ARN = os.environ.get("AGENT_REGISTRY_ARN", "")
 MODEL_ID = os.environ.get(
     "ORCHESTRATOR_MODEL_ID",
     "apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
 )
+
+logger.info(
+    "boot: REGION=%s REGISTRY_ID=%r REGISTRY_ARN=%r MODEL_ID=%r",
+    REGION,
+    REGISTRY_ID,
+    REGISTRY_ARN,
+    MODEL_ID,
+)
+
+# Defer the heavy imports until after logging is configured so any import-time
+# failures appear in the same log stream.
+try:
+    from strands import Agent
+    from strands_tools.a2a_client import A2AClientToolProvider
+    logger.info("imports OK: strands + strands_tools.a2a_client")
+except Exception:
+    logger.exception("FATAL: import of strands / a2a_client failed")
+    raise
 
 _app = BedrockAgentCoreApp()
 _agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
 
 
 def _list_subagent_endpoints() -> list[str]:
-    """Search registry for A2A-type approved records and return their A2A URLs.
-
-    Schema (control-plane create input mirrors the data-plane search output):
-      descriptorType: 'A2A'
-      descriptors.a2a.agentCard.inlineContent  → JSON A2A Agent Card
-    The card's `url` field is the A2A endpoint to talk to.
-    """
+    """Return A2A endpoint URLs from approved A2A records in the registry."""
     endpoints: list[str] = []
-    paginator_kwargs: dict[str, Any] = {
-        "registryIds": [REGISTRY_ARN],
-        "searchQuery": "agent",
-        "maxResults": 20,  # search_registry_records caps at 20
-    }
-    resp = _agentcore.search_registry_records(**paginator_kwargs)
+    resp = _agentcore.search_registry_records(
+        registryIds=[REGISTRY_ARN],
+        searchQuery="agent",
+        maxResults=20,
+    )
+    record_count = len(resp.get("registryRecords", []))
+    logger.info("search_registry_records returned %d records", record_count)
     for rec in resp.get("registryRecords", []):
-        if rec.get("descriptorType") != "A2A":
+        name = rec.get("name")
+        dtype = rec.get("descriptorType")
+        status = rec.get("status")
+        logger.info("  record name=%s type=%s status=%s", name, dtype, status)
+        if dtype != "A2A":
             continue
         try:
             card_str = rec["descriptors"]["a2a"]["agentCard"]["inlineContent"]
             card = json.loads(card_str) if isinstance(card_str, str) else card_str
             url = card.get("url")
+            logger.info("    -> url=%r", url)
             if url:
                 endpoints.append(url)
         except (KeyError, json.JSONDecodeError) as e:
-            logger.warning("could not parse agent card for record %s: %s", rec.get("name"), e)
+            logger.warning("could not parse agent card for record %s: %s", name, e)
     return endpoints
 
 
 def _build_agent() -> Agent:
-    endpoints = _list_subagent_endpoints()
+    try:
+        endpoints = _list_subagent_endpoints()
+    except Exception:
+        logger.exception("FATAL: _list_subagent_endpoints raised")
+        raise
     logger.info("discovered %d sub-agent endpoints: %s", len(endpoints), endpoints)
 
-    provider = A2AClientToolProvider(known_agent_urls=endpoints) if endpoints else None
-    tools = provider.tools if provider else []
+    tools: list[Any] = []
+    if endpoints:
+        try:
+            provider = A2AClientToolProvider(known_agent_urls=endpoints)
+            tools = list(provider.tools)
+            logger.info("A2AClientToolProvider produced %d tools", len(tools))
+        except Exception:
+            logger.exception(
+                "FATAL: A2AClientToolProvider(known_agent_urls=%s) raised", endpoints
+            )
+            raise
 
-    return Agent(
-        name="orchestrator",
-        description="ユーザーのリクエストを適切なサブエージェントに振り分けるオーケストレーター。",
-        system_prompt=(
-            "あなたはオーケストレーターエージェントです。あなた自身は処理を実行しません。\n"
-            "利用可能なサブエージェント（A2A 経由のツール）を見て、リクエスト内容に最も適した"
-            "サブエージェントにディスパッチし、その回答をそのまま返してください。\n"
-            "適切なサブエージェントが見つからない場合は、その旨を日本語で返してください。"
-        ),
-        model=MODEL_ID,
-        tools=tools,
-        callback_handler=None,
-    )
+    try:
+        return Agent(
+            name="orchestrator",
+            description="ユーザーのリクエストを適切なサブエージェントに振り分けるオーケストレーター。",
+            system_prompt=(
+                "あなたはオーケストレーターエージェントです。あなた自身は処理を実行しません。\n"
+                "利用可能なサブエージェント（A2A 経由のツール）を見て、リクエスト内容に最も適した"
+                "サブエージェントにディスパッチし、その回答をそのまま返してください。\n"
+                "適切なサブエージェントが見つからない場合は、その旨を日本語で返してください。"
+            ),
+            model=MODEL_ID,
+            tools=tools,
+            callback_handler=None,
+        )
+    except Exception:
+        logger.exception("FATAL: Agent(...) construction failed (model=%r)", MODEL_ID)
+        raise
 
 
 @_app.entrypoint
 def invoke(payload: dict, context: Any = None) -> dict:  # noqa: ARG001
-    """AgentCore Runtime HTTP entrypoint.
-
-    Expected payload: {"prompt": "<自然言語>"}.
-    """
-    prompt = payload.get("prompt") or payload.get("input") or ""
+    """AgentCore Runtime HTTP entrypoint. Payload: {"prompt": "..."}."""
+    logger.info("INVOKE payload keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload))
+    prompt = (payload or {}).get("prompt") or (payload or {}).get("input") or ""
     if not prompt:
         return {"error": "missing 'prompt' in payload"}
-    agent = _build_agent()
-    result = agent(prompt)
-    return {"result": str(result)}
+
+    try:
+        agent = _build_agent()
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("orchestrator build failure:\n%s", tb)
+        return {"error": f"orchestrator build failed: {type(e).__name__}: {e}", "trace": tb}
+
+    try:
+        result = agent(prompt)
+        return {"result": str(result)}
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("orchestrator invoke failure:\n%s", tb)
+        return {"error": f"orchestrator invoke failed: {type(e).__name__}: {e}", "trace": tb}
 
 
 if __name__ == "__main__":
+    logger.info("starting BedrockAgentCoreApp on default port")
     _app.run()
