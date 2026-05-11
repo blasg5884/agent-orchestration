@@ -45,7 +45,7 @@ def _list_subagent_endpoints() -> list[str]:
     paginator_kwargs: dict[str, Any] = {
         "registryIds": [REGISTRY_ARN],
         "searchQuery": "agent",
-        "maxResults": 50,
+        "maxResults": 20,  # search_registry_records caps at 20
     }
     resp = _agentcore.search_registry_records(**paginator_kwargs)
     for rec in resp.get("registryRecords", []):

@@ -58,10 +58,11 @@ def handler(event: dict, _context: Any) -> dict:
         if name_filter:
             # Search filtered to a specific name. search_registry_records returns
             # only APPROVED records; that's the desired behavior for a public listing.
+            # search_registry_records caps maxResults at 20.
             resp = _data.search_registry_records(
                 registryIds=[REGISTRY_ARN],
                 searchQuery=name_filter,
-                maxResults=50,
+                maxResults=20,
             )
             records = [
                 _serialize(r)
