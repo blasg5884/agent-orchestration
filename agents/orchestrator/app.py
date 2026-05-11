@@ -129,10 +129,18 @@ def _build_agent() -> Agent:
 
 
 @_app.entrypoint
-def invoke(payload: dict, context: Any = None) -> dict:  # noqa: ARG001
+def invoke(payload):  # signature matches the AgentCore Strands sample exactly
     """AgentCore Runtime HTTP entrypoint. Payload: {"prompt": "..."}."""
-    logger.info("INVOKE payload keys=%s", list(payload.keys()) if isinstance(payload, dict) else type(payload))
-    prompt = (payload or {}).get("prompt") or (payload or {}).get("input") or ""
+    logger.info("============ INVOKE CALLED ============")
+    logger.info("INVOKE raw payload: %r (type=%s)", payload, type(payload).__name__)
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(payload) if isinstance(payload, (str, bytes, bytearray)) else dict(payload)
+            logger.info("INVOKE parsed payload to dict: %r", payload)
+        except Exception:
+            logger.exception("INVOKE could not coerce payload to dict")
+            return {"error": f"unsupported payload type: {type(payload).__name__}"}
+    prompt = payload.get("prompt") or payload.get("input") or ""
     if not prompt:
         return {"error": "missing 'prompt' in payload"}
 
@@ -153,13 +161,32 @@ def invoke(payload: dict, context: Any = None) -> dict:  # noqa: ARG001
 
 
 if __name__ == "__main__":
-    # Surface SDK version + the actual bind config so we can verify it
-    # matches what AgentCore Runtime is contacting (HTTP protocol = port 8080).
+    # Use importlib.metadata for an accurate installed version, regardless of
+    # whether the package exposes __version__.
     try:
-        import bedrock_agentcore as _bac
-        logger.info("bedrock_agentcore version: %s", getattr(_bac, "__version__", "unknown"))
+        from importlib.metadata import version as _pkg_version
+        logger.info("bedrock-agentcore version: %s", _pkg_version("bedrock-agentcore"))
     except Exception:
-        logger.exception("could not read bedrock_agentcore version")
+        logger.exception("could not read bedrock-agentcore version")
+
+    # Inspect the BedrockAgentCoreApp object so we can see what surface it
+    # actually exposes (routes, run signature, etc.) without needing the SDK
+    # docs handy.
+    try:
+        attrs = [a for a in dir(_app) if not a.startswith("_")]
+        logger.info("BedrockAgentCoreApp public attrs: %s", attrs)
+        import inspect
+        sig = inspect.signature(_app.run)
+        logger.info("_app.run signature: %s", sig)
+    except Exception:
+        logger.exception("could not introspect BedrockAgentCoreApp")
+
+    # Log any env vars AgentCore Runtime might inject for port/host.
+    relevant_env = {
+        k: v for k, v in os.environ.items()
+        if any(token in k.upper() for token in ("PORT", "HOST", "BEDROCK", "AGENT"))
+    }
+    logger.info("relevant env vars: %s", relevant_env)
 
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
@@ -167,6 +194,8 @@ if __name__ == "__main__":
     try:
         _app.run(host=host, port=port)
     except TypeError:
-        # Older SDK signatures may not accept host/port — fall back.
         logger.warning("_app.run(host, port) signature rejected; falling back to _app.run()")
         _app.run()
+    except Exception:
+        logger.exception("_app.run() raised unexpectedly")
+        raise
