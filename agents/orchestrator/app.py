@@ -35,7 +35,10 @@ REGISTRY_ID = os.environ.get("AGENT_REGISTRY_ID", "")
 REGISTRY_ARN = os.environ.get("AGENT_REGISTRY_ARN", "")
 MODEL_ID = os.environ.get(
     "ORCHESTRATOR_MODEL_ID",
-    "apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    # Default to Haiku 4.5 (apac cross-region inference profile) because it
+    # is more frequently pre-enabled in fresh accounts in ap-northeast-1.
+    # Override via the ORCHESTRATOR_MODEL_ID env var to use Sonnet/Opus etc.
+    "apac.anthropic.claude-haiku-4-5-20251001-v1:0",
 )
 
 logger.info(
