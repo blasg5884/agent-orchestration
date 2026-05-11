@@ -45,7 +45,15 @@ def handler(event: dict, _context: Any) -> dict:
     if not prompt:
         return _resp(400, {"error": "'prompt' is required"})
 
-    session_id = body.get("sessionId") or str(uuid.uuid4())
+    # invoke_agent_runtime requires runtimeSessionId to be 33–100 chars.
+    # If a caller-supplied sessionId is too short, pad it deterministically.
+    raw_session = body.get("sessionId") or ""
+    if len(raw_session) >= 33:
+        session_id = raw_session
+    elif raw_session:
+        session_id = (raw_session + "-" + uuid.uuid4().hex)[:100]
+    else:
+        session_id = uuid.uuid4().hex + uuid.uuid4().hex[:1]  # 33 chars
 
     try:
         resp = _agentcore.invoke_agent_runtime(
