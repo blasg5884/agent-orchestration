@@ -230,62 +230,85 @@ export class AgentsStack extends cdk.Stack {
   /**
    * Single role shared by all runtimes (prototype). Allows ECR pull, Bedrock model
    * invocation, AgentCore A2A calls, and Registry search.
+   *
+   * Policies are attached as inlinePolicies (embedded in the Role resource)
+   * rather than via addToPolicy() — the latter creates a separate AWS::IAM::Policy
+   * resource that the CfnRuntime does not auto-depend on, leading to a race:
+   * AgentCore Control validates ECR access at runtime-creation time and fails
+   * with "Access denied while validating ECR URI" before the inline policy
+   * is attached. Inline policies are part of the role's CFn resource and
+   * therefore exist atomically with the role.
    */
   private createRuntimeRole(): iam.Role {
-    const role = new iam.Role(this, 'AgentRuntimeRole', {
+    return new iam.Role(this, 'AgentRuntimeRole', {
       assumedBy: new iam.ServicePrincipal('bedrock-agentcore.amazonaws.com', {
         conditions: {
           StringEquals: { 'aws:SourceAccount': cdk.Aws.ACCOUNT_ID },
+          // Use ":*" rather than ":runtime/*" so the trust policy also permits
+          // the validation-phase AssumeRole (where no runtime ARN exists yet).
           ArnLike: {
-            'aws:SourceArn': `arn:aws:bedrock-agentcore:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:runtime/*`,
+            'aws:SourceArn': `arn:aws:bedrock-agentcore:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:*`,
           },
         },
       }),
+      inlinePolicies: {
+        EcrPull: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['ecr:GetAuthorizationToken'],
+              resources: ['*'],
+            }),
+            new iam.PolicyStatement({
+              actions: [
+                'ecr:BatchCheckLayerAvailability',
+                'ecr:GetDownloadUrlForLayer',
+                'ecr:BatchGetImage',
+              ],
+              resources: ['*'],
+            }),
+          ],
+        }),
+        BedrockInvoke: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                'bedrock:InvokeModel',
+                'bedrock:InvokeModelWithResponseStream',
+                'bedrock:Converse',
+                'bedrock:ConverseStream',
+              ],
+              resources: ['*'],
+            }),
+          ],
+        }),
+        AgentCore: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                'bedrock-agentcore:InvokeAgentRuntime',
+                'bedrock-agentcore:InvokeAgent',
+                'bedrock-agentcore:SearchRegistryRecords',
+                'bedrock-agentcore:ListRegistryRecords',
+                'bedrock-agentcore:GetRegistryRecord',
+              ],
+              resources: ['*'],
+            }),
+          ],
+        }),
+        Logs: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                'logs:CreateLogGroup',
+                'logs:CreateLogStream',
+                'logs:PutLogEvents',
+                'logs:DescribeLogStreams',
+              ],
+              resources: ['*'],
+            }),
+          ],
+        }),
+      },
     });
-    role.addToPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'bedrock:InvokeModel',
-          'bedrock:InvokeModelWithResponseStream',
-          'bedrock:Converse',
-          'bedrock:ConverseStream',
-        ],
-        resources: ['*'],
-      }),
-    );
-    role.addToPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'bedrock-agentcore:InvokeAgentRuntime',
-          'bedrock-agentcore:InvokeAgent',
-          'bedrock-agentcore:SearchRegistryRecords',
-          'bedrock-agentcore:ListRegistryRecords',
-          'bedrock-agentcore:GetRegistryRecord',
-        ],
-        resources: ['*'],
-      }),
-    );
-    role.addToPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'ecr:GetAuthorizationToken',
-          'ecr:BatchCheckLayerAvailability',
-          'ecr:GetDownloadUrlForLayer',
-          'ecr:BatchGetImage',
-        ],
-        resources: ['*'],
-      }),
-    );
-    role.addToPolicy(
-      new iam.PolicyStatement({
-        actions: [
-          'logs:CreateLogStream',
-          'logs:PutLogEvents',
-          'logs:CreateLogGroup',
-        ],
-        resources: ['*'],
-      }),
-    );
-    return role;
   }
 }
