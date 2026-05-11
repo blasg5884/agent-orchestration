@@ -37,11 +37,15 @@ def handler(event: dict, _context: Any) -> dict:
     props: dict = event.get("ResourceProperties", {}) or {}
 
     if req == "Create":
+        # Parameter shape per the preview boto3 model (validated against the
+        # service via "Unknown parameter" errors):
+        #   name, description, authorizerType, authorizerConfiguration,
+        #   clientToken, approvalConfiguration
         resp = _client.create_registry(
             name=props["name"],
             description=props.get("description", ""),
-            searchApiAuthorization={"authType": "IAM"},
-            recordApprovalConfiguration={
+            authorizerType="IAM",
+            approvalConfiguration={
                 "autoApprovalEnabled": _truthy(props.get("autoApprove", "true")),
             },
         )
