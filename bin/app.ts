@@ -13,9 +13,9 @@ const env: cdk.Environment = {
 };
 
 // 1. AgentCore Agent Registry (preview API via Custom Resource)
-const registryStack = new RegistryStack(app, 'AgentOrchestrationRegistryStack', {
+const registryStack = new RegistryStack(app, 'AgentRegistryStack', {
   env,
-  registryName: 'AgentOrchestrationRegistry',
+  registryName: 'AgentRegistry',
 });
 
 // 2. AgentCore Runtimes: orchestrator + 2 sub-agents (weather, zipcode)
