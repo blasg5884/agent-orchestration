@@ -74,7 +74,7 @@ def handler(event: dict, _context: Any) -> dict:
         records: list[dict] = []
         next_token: str | None = None
         while True:
-            kwargs: dict[str, Any] = {"registryId": REGISTRY_ID, "maxResults": 100}
+            kwargs: dict[str, Any] = {"registryId": REGISTRY_ARN, "maxResults": 100}
             if next_token:
                 kwargs["nextToken"] = next_token
             resp = _control.list_registry_records(**kwargs)

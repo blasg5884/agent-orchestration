@@ -9,7 +9,14 @@ import {
 } from 'aws-cdk-lib/custom-resources';
 
 export interface RegistryRecordProps {
-  readonly registryId: string;
+  /**
+   * Registry ARN (e.g. arn:aws:bedrock-agentcore:ap-northeast-1:123:registry/xyz).
+   * The bedrock-agentcore-control API accepts both the short ID and the full ARN
+   * for the `registryId` parameter. Using the ARN is safer because the short ID
+   * format returned by createRegistry may not always match the expected alphanumeric
+   * pattern validated by the API.
+   */
+  readonly registryArn: string;
   /** Record name (1–255 chars). */
   readonly name: string;
   readonly description?: string;
@@ -53,7 +60,7 @@ export class RegistryRecord extends Construct {
         service: 'bedrock-agentcore-control',
         action: 'createRegistryRecord',
         parameters: {
-          registryId: props.registryId,
+          registryId: props.registryArn,
           name: props.name,
           description: props.description ?? props.name,
           recordVersion: props.recordVersion,
@@ -73,7 +80,7 @@ export class RegistryRecord extends Construct {
         service: 'bedrock-agentcore-control',
         action: 'deleteRegistryRecord',
         parameters: {
-          registryId: props.registryId,
+          registryId: props.registryArn,
           recordId: new PhysicalResourceIdReference(),
         },
       },
@@ -91,7 +98,7 @@ export class RegistryRecord extends Construct {
           service: 'bedrock-agentcore-control',
           action: 'submitRegistryRecordForApproval',
           parameters: {
-            registryId: props.registryId,
+            registryId: props.registryArn,
             recordId: this.recordId,
           },
           physicalResourceId: PhysicalResourceId.of(`${this.recordId}-submit`),

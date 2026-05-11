@@ -113,7 +113,7 @@ export class AgentsStack extends cdk.Stack {
         })),
       };
       new RegistryRecord(this, `${spec.key}Record`, {
-        registryId: props.registryId,
+        registryArn: props.registryArn,
         name: spec.runtimeName,
         description: spec.description,
         recordVersion: '1.0.0',
