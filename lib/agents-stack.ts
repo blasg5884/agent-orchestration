@@ -217,6 +217,11 @@ export class AgentsStack extends cdk.Stack {
         AGENT_REGISTRY_ID: registryIdFromSsm,
         AGENT_REGISTRY_ARN: registryArnFromSsm,
         AGENT_REGISTRY_NAME: registryNameFromSsm,
+        // Override the model id without rebuilding the container image.
+        // Set ORCHESTRATOR_MODEL_ID in your shell before `cdk deploy` to
+        // pin a specific Bedrock model (e.g. one you have access to).
+        ORCHESTRATOR_MODEL_ID:
+          process.env.ORCHESTRATOR_MODEL_ID ?? 'apac.anthropic.claude-sonnet-4-20250514-v1:0',
       },
     });
     orchestrator.addDependency(runtimeRole.node.defaultChild as cdk.CfnResource);
