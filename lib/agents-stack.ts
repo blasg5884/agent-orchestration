@@ -3,6 +3,9 @@ import * as path from 'path';
 import { Construct } from 'constructs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import * as ecrAssets from 'aws-cdk-lib/aws-ecr-assets';
 import * as bedrockagentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import { RegistryRecord } from './registry-record';
@@ -10,13 +13,12 @@ import { RegistryRecord } from './registry-record';
 export interface AgentsStackProps extends cdk.StackProps {
   readonly registryId: string;
   readonly registryArn: string;
-  /**
-   * SSM Parameter Store path created by RegistryStack that holds the registry ARN.
-   * Used for AwsCustomResource parameters where CDK cross-stack tokens may not
-   * resolve correctly. CloudFormation resolves SSM dynamic references before Lambda
-   * invocation, so the Lambda always receives the actual ARN string.
-   */
+  /** SSM Parameter Store path that holds the registry ARN (set by RegistryStack). */
   readonly registryArnSsmParamName: string;
+  /** SSM Parameter Store path that holds the registry short ID (set by RegistryStack). */
+  readonly registryIdSsmParamName: string;
+  /** SSM Parameter Store path that holds the registry name (set by RegistryStack). */
+  readonly registryNameSsmParamName: string;
 }
 
 interface SubAgentSpec {
@@ -67,8 +69,10 @@ const SUBAGENTS: ReadonlyArray<SubAgentSpec> = [
  * Provisions:
  *  - One AgentCore Runtime per sub-agent (A2A protocol)
  *  - One AgentCore Runtime for the orchestrator (HTTP protocol)
- *  - One Registry record (AGENT-type) per sub-agent so the orchestrator
- *    can discover them at runtime.
+ *  - One Registry record (AGENT-type) per sub-agent so the orchestrator can
+ *    discover them at runtime.
+ *  - A shared Lambda Provider for registry-record CRUD (boto3-based, with
+ *    full CloudWatch logging of the preview API responses).
  */
 export class AgentsStack extends cdk.Stack {
   public readonly orchestratorRuntimeArn: string;
@@ -78,14 +82,48 @@ export class AgentsStack extends cdk.Stack {
 
     const runtimeRole = this.createRuntimeRole();
 
-    // Resolve the registry ARN via SSM dynamic reference.
-    // CloudFormation resolves {{resolve:ssm:/...}} before invoking any Lambda, so
-    // AwsCustomResource parameters receive the actual ARN string rather than a
-    // CDK cross-stack CFn token (which can remain unresolved inside Custom Resource params).
+    // Resolve registry identifier candidates via SSM dynamic references.
+    // CloudFormation resolves these before any Lambda invocation.
+    const registryIdFromSsm = ssm.StringParameter.valueForStringParameter(
+      this,
+      props.registryIdSsmParamName,
+    );
     const registryArnFromSsm = ssm.StringParameter.valueForStringParameter(
       this,
       props.registryArnSsmParamName,
     );
+    const registryNameFromSsm = ssm.StringParameter.valueForStringParameter(
+      this,
+      props.registryNameSsmParamName,
+    );
+
+    // Lambda Provider for registry-record CRUD (boto3, full logging).
+    const recordProviderFn = new lambda.Function(this, 'RecordProviderFn', {
+      runtime: lambda.Runtime.PYTHON_3_13,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/registry_record_provider')),
+      timeout: cdk.Duration.minutes(10),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_WEEK,
+    });
+    recordProviderFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'bedrock-agentcore:CreateRegistryRecord',
+          'bedrock-agentcore:DeleteRegistryRecord',
+          'bedrock-agentcore:GetRegistryRecord',
+          'bedrock-agentcore:UpdateRegistryRecord',
+          'bedrock-agentcore:SubmitRegistryRecordForApproval',
+          'bedrock-agentcore:UpdateRegistryRecordStatus',
+          'bedrock-agentcore:ListRegistryRecords',
+        ],
+        resources: ['*'],
+      }),
+    );
+    const recordProvider = new cr.Provider(this, 'RecordProvider', {
+      onEventHandler: recordProviderFn,
+      logRetention: logs.RetentionDays.ONE_WEEK,
+    });
 
     // --- Sub-agents (A2A) ---
     const subAgentEndpoints: { spec: SubAgentSpec; runtime: bedrockagentcore.CfnRuntime }[] = [];
@@ -111,6 +149,13 @@ export class AgentsStack extends cdk.Stack {
     }
 
     // --- Register sub-agents in Agent Registry (AGENT record) ---
+    //
+    // The createRegistryRecord API requires `registryId` to match
+    //   (arn:aws...:registry/[a-zA-Z0-9]{12,16})  |  [a-zA-Z0-9]{12,16}
+    //
+    // We pass the SHORT ID from SSM (set by the registry provider Lambda from
+    // the createRegistry response). If that's unavailable for some reason the
+    // Lambda logs include the empty value so we can debug.
     for (const { spec, runtime } of subAgentEndpoints) {
       const agentCard = {
         name: spec.runtimeName,
@@ -130,7 +175,8 @@ export class AgentsStack extends cdk.Stack {
         })),
       };
       new RegistryRecord(this, `${spec.key}Record`, {
-        registryArn: registryArnFromSsm,
+        providerServiceToken: recordProvider.serviceToken,
+        registryId: registryIdFromSsm,
         name: spec.runtimeName,
         description: spec.description,
         recordVersion: '1.0.0',
@@ -156,8 +202,9 @@ export class AgentsStack extends cdk.Stack {
         },
       },
       environmentVariables: {
-        AGENT_REGISTRY_ID: props.registryId,
-        AGENT_REGISTRY_ARN: props.registryArn,
+        AGENT_REGISTRY_ID: registryIdFromSsm,
+        AGENT_REGISTRY_ARN: registryArnFromSsm,
+        AGENT_REGISTRY_NAME: registryNameFromSsm,
       },
     });
     orchestrator.addDependency(runtimeRole.node.defaultChild as cdk.CfnResource);

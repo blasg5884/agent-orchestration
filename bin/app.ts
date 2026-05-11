@@ -24,6 +24,8 @@ const agentsStack = new AgentsStack(app, 'AgentOrchestrationAgentsStack', {
   registryId: registryStack.registryId,
   registryArn: registryStack.registryArn,
   registryArnSsmParamName: registryStack.registryArnSsmParamName,
+  registryIdSsmParamName: registryStack.registryIdSsmParamName,
+  registryNameSsmParamName: registryStack.registryNameSsmParamName,
 });
 agentsStack.addDependency(registryStack);
 
