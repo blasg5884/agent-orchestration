@@ -181,6 +181,19 @@ if __name__ == "__main__":
     except Exception:
         logger.exception("could not introspect BedrockAgentCoreApp")
 
+    # Dump the actual routes registered on the app so we can see exactly
+    # where @entrypoint mapped our invoke function, and whether AgentCore's
+    # POST /invocations will hit it.
+    try:
+        for r in getattr(_app, "routes", []):
+            path = getattr(r, "path", "?")
+            methods = getattr(r, "methods", None)
+            endpoint = getattr(r, "endpoint", None)
+            endpoint_name = getattr(endpoint, "__qualname__", repr(endpoint))
+            logger.info("ROUTE %s %s -> %s", methods, path, endpoint_name)
+    except Exception:
+        logger.exception("could not list routes")
+
     # Log any env vars AgentCore Runtime might inject for port/host.
     relevant_env = {
         k: v for k, v in os.environ.items()
@@ -188,14 +201,19 @@ if __name__ == "__main__":
     }
     logger.info("relevant env vars: %s", relevant_env)
 
-    host = os.environ.get("HOST", "0.0.0.0")
+    # SDK 1.9 signature is _app.run(port, host=None, **kwargs). host=None
+    # means "let the SDK decide" — pass nothing and trust its default; only
+    # override via PORT/HOST env if you really need to.
     port = int(os.environ.get("PORT", "8080"))
-    logger.info("starting BedrockAgentCoreApp on %s:%d", host, port)
+    host_override = os.environ.get("HOST")  # None unless explicitly set
+    logger.info(
+        "starting BedrockAgentCoreApp (port=%d, host_override=%r)", port, host_override
+    )
     try:
-        _app.run(host=host, port=port)
-    except TypeError:
-        logger.warning("_app.run(host, port) signature rejected; falling back to _app.run()")
-        _app.run()
+        if host_override:
+            _app.run(port=port, host=host_override)
+        else:
+            _app.run(port=port)
     except Exception:
         logger.exception("_app.run() raised unexpectedly")
         raise
