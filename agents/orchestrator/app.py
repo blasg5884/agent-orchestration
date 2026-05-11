@@ -1,8 +1,18 @@
 """Orchestrator agent.
 
-Exposes an HTTP entrypoint via the bedrock-agentcore SDK (BedrockAgentCoreApp).
-Discovers sub-agents from Agent Registry, wires them as A2A tools, and lets
-the LLM decide which sub-agent to dispatch to.
+Discovers sub-agents via the AgentCore Agent Registry MCP endpoint
+(https://bedrock-agentcore.<region>.amazonaws.com/registry/<registryId>/mcp),
+which exposes the `search_registry_records` tool with semantic search.
+
+Dispatch flow:
+  1. LLM calls `search_registry_records` (provided by the Registry MCP)
+     with a natural-language query like "weather" or "japan postal code".
+     It can additionally filter by descriptorType / version / name.
+  2. From the returned record summaries the LLM picks an agent and calls
+     our custom `invoke_subagent(record_id, prompt)` tool, which:
+       - resolves the record's agent card via get_registry_record
+       - extracts the runtime ARN from the card
+       - calls bedrock-agentcore:InvokeAgentRuntime to dispatch.
 
 This agent itself performs NO domain work — it only routes.
 """
@@ -13,14 +23,12 @@ import logging
 import os
 import sys
 import traceback
+import uuid
 from typing import Any
 
 import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
-# Configure logging to stdout with force=True so any default handlers from
-# BedrockAgentCoreApp / Strands don't suppress our records. PYTHONUNBUFFERED=1
-# is set in the Dockerfile to ensure prompt flushing.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
@@ -35,38 +43,38 @@ REGISTRY_ID = os.environ.get("AGENT_REGISTRY_ID", "")
 REGISTRY_ARN = os.environ.get("AGENT_REGISTRY_ARN", "")
 MODEL_ID = os.environ.get(
     "ORCHESTRATOR_MODEL_ID",
-    # Claude Sonnet 4 via the APAC cross-region inference profile. This profile
-    # is well-established for ap-northeast-1 and is the safest default if the
-    # newer 4.5/4.6/4.7 profiles aren't enabled in the target account yet.
-    # Override via the ORCHESTRATOR_MODEL_ID env var to use a different model.
+    # APAC cross-region inference profile for Claude Sonnet 4 — broadly
+    # available in ap-northeast-1. Override with ORCHESTRATOR_MODEL_ID env var
+    # if you have a different model enabled in Bedrock.
     "apac.anthropic.claude-sonnet-4-20250514-v1:0",
+)
+REGISTRY_MCP_URL = (
+    f"https://bedrock-agentcore.{REGION}.amazonaws.com/registry/{REGISTRY_ID}/mcp"
 )
 
 logger.info(
-    "boot: REGION=%s REGISTRY_ID=%r REGISTRY_ARN=%r MODEL_ID=%r",
-    REGION,
-    REGISTRY_ID,
-    REGISTRY_ARN,
-    MODEL_ID,
+    "boot: REGION=%s REGISTRY_ID=%r REGISTRY_ARN=%r MODEL_ID=%r MCP_URL=%r",
+    REGION, REGISTRY_ID, REGISTRY_ARN, MODEL_ID, REGISTRY_MCP_URL,
 )
 
-# Defer the heavy imports until after logging is configured so any import-time
-# failures appear in the same log stream.
+# Defer heavy imports until after logging is configured so import-time
+# failures appear in the same stream.
 try:
-    from strands import Agent
-    from strands_tools.a2a_client import A2AClientToolProvider
-    logger.info("imports OK: strands + strands_tools.a2a_client")
+    from strands import Agent, tool
+    from strands.tools.mcp.mcp_client import MCPClient
+    from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
+    logger.info("imports OK: strands.Agent + MCPClient + aws_iam_streamablehttp_client")
 except Exception:
-    logger.exception("FATAL: import of strands / a2a_client failed")
+    logger.exception("FATAL: import failed")
     raise
 
 _app = BedrockAgentCoreApp()
 _agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
+_agentcore_control = boto3.client("bedrock-agentcore-control", region_name=REGION)
 
 
-# Starlette/FastAPI-style middleware that logs every incoming HTTP request so
-# we can confirm whether AgentCore is actually reaching the container and
-# what content-type / shape it's sending.
+# Starlette-style middleware: log every incoming HTTP request to confirm
+# AgentCore reaches us and to show the body shape.
 @_app.middleware("http")
 async def _log_requests(request, call_next):
     try:
@@ -75,119 +83,109 @@ async def _log_requests(request, call_next):
         body = b"(could not read body)"
     logger.info(
         "HTTP %s %s ct=%r len=%d body=%r",
-        request.method,
-        request.url.path,
-        request.headers.get("content-type"),
+        request.method, request.url.path, request.headers.get("content-type"),
         len(body) if isinstance(body, (bytes, bytearray)) else -1,
         body[:500] if isinstance(body, (bytes, bytearray)) else body,
     )
 
-    async def _replay_receive():
+    async def _replay():
         return {"type": "http.request", "body": body, "more_body": False}
-    # Re-inject the body because await request.body() consumes the stream.
-    request._receive = _replay_receive
+    request._receive = _replay
 
     try:
         response = await call_next(request)
     except Exception:
         logger.exception("middleware: unhandled exception during request")
         raise
-    logger.info(
-        "HTTP %s %s -> %d",
-        request.method,
-        request.url.path,
-        getattr(response, "status_code", "?"),
-    )
+    logger.info("HTTP %s %s -> %d", request.method, request.url.path, getattr(response, "status_code", "?"))
     return response
 
 
 @_app.exception_handler(Exception)
 async def _global_exception_handler(request, exc):
-    logger.exception("UNHANDLED exception during %s %s: %s", request.method, request.url.path, exc)
+    logger.exception("UNHANDLED %s %s: %s", request.method, request.url.path, exc)
     from starlette.responses import JSONResponse
-    return JSONResponse(
-        status_code=500,
-        content={"error": f"{type(exc).__name__}: {exc}"},
+    return JSONResponse(status_code=500, content={"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _make_session_id() -> str:
+    """invoke_agent_runtime requires runtimeSessionId length in [33, 100]."""
+    return uuid.uuid4().hex + uuid.uuid4().hex[:1]  # 33 chars
+
+
+def _resolve_runtime_arn_for_record(record_id: str) -> str:
+    """Look up the AgentCore Runtime ARN stored in a registry record's agent card."""
+    rec = _agentcore_control.get_registry_record(
+        registryId=REGISTRY_ARN, recordId=record_id,
     )
-
-
-def _list_subagent_endpoints() -> list[str]:
-    """Return A2A endpoint URLs from approved A2A records in the registry."""
-    endpoints: list[str] = []
-    resp = _agentcore.search_registry_records(
-        registryIds=[REGISTRY_ARN],
-        searchQuery="agent",
-        maxResults=20,
-    )
-    record_count = len(resp.get("registryRecords", []))
-    logger.info("search_registry_records returned %d records", record_count)
-    for rec in resp.get("registryRecords", []):
-        name = rec.get("name")
-        dtype = rec.get("descriptorType")
-        status = rec.get("status")
-        logger.info("  record name=%s type=%s status=%s", name, dtype, status)
-        if dtype != "A2A":
-            continue
-        try:
-            card_str = rec["descriptors"]["a2a"]["agentCard"]["inlineContent"]
-            card = json.loads(card_str) if isinstance(card_str, str) else card_str
-            url = card.get("url")
-            logger.info("    -> url=%r", url)
-            if url:
-                endpoints.append(url)
-        except (KeyError, json.JSONDecodeError) as e:
-            logger.warning("could not parse agent card for record %s: %s", name, e)
-    return endpoints
-
-
-def _build_agent() -> Agent:
-    try:
-        endpoints = _list_subagent_endpoints()
-    except Exception:
-        logger.exception("FATAL: _list_subagent_endpoints raised")
-        raise
-    logger.info("discovered %d sub-agent endpoints: %s", len(endpoints), endpoints)
-
-    tools: list[Any] = []
-    if endpoints:
-        try:
-            provider = A2AClientToolProvider(known_agent_urls=endpoints)
-            tools = list(provider.tools)
-            logger.info("A2AClientToolProvider produced %d tools", len(tools))
-        except Exception:
-            logger.exception(
-                "FATAL: A2AClientToolProvider(known_agent_urls=%s) raised", endpoints
-            )
-            raise
-
-    try:
-        return Agent(
-            name="orchestrator",
-            description="ユーザーのリクエストを適切なサブエージェントに振り分けるオーケストレーター。",
-            system_prompt=(
-                "あなたはオーケストレーターエージェントです。あなた自身は処理を実行しません。\n"
-                "利用可能なサブエージェント（A2A 経由のツール）を見て、リクエスト内容に最も適した"
-                "サブエージェントにディスパッチし、その回答をそのまま返してください。\n"
-                "適切なサブエージェントが見つからない場合は、その旨を日本語で返してください。"
-            ),
-            model=MODEL_ID,
-            tools=tools,
-            callback_handler=None,
+    descriptors = rec.get("descriptors") or {}
+    a2a = descriptors.get("a2a") or {}
+    card_def = a2a.get("agentCard") or {}
+    inline = card_def.get("inlineContent")
+    if not inline:
+        raise RuntimeError(
+            f"record {record_id} has no descriptors.a2a.agentCard.inlineContent"
         )
+    card = json.loads(inline) if isinstance(inline, str) else inline
+    url = card.get("url")
+    if not url:
+        raise RuntimeError(f"agent card for record {record_id} has no 'url' field")
+    return url
+
+
+@tool
+def invoke_subagent(record_id: str, prompt: str) -> str:
+    """Invoke a sub-agent (registered in the Agent Registry) by its record id.
+
+    Use this AFTER calling `search_registry_records` to find an appropriate
+    agent. Pass the `recordId` you got from search and the user's prompt
+    (in natural language). The sub-agent's response is returned as a string.
+
+    Args:
+        record_id: The recordId field from a search_registry_records result.
+        prompt: The natural-language request to forward to the sub-agent.
+    """
+    logger.info("invoke_subagent record_id=%s prompt=%r", record_id, prompt)
+    try:
+        runtime_arn = _resolve_runtime_arn_for_record(record_id)
+    except Exception as e:
+        logger.exception("invoke_subagent: could not resolve runtime ARN")
+        return f"failed to resolve sub-agent: {type(e).__name__}: {e}"
+
+    session_id = _make_session_id()
+    logger.info("invoke_subagent dispatching to %s session=%s", runtime_arn, session_id)
+    try:
+        resp = _agentcore.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            qualifier="DEFAULT",
+            runtimeSessionId=session_id,
+            payload=json.dumps({"prompt": prompt}).encode("utf-8"),
+            contentType="application/json",
+            accept="application/json",
+        )
+    except Exception as e:
+        logger.exception("invoke_subagent: invoke_agent_runtime failed")
+        return f"sub-agent invocation failed: {type(e).__name__}: {e}"
+
+    body = resp["response"].read()
+    text = body.decode("utf-8", errors="replace")
+    logger.info("invoke_subagent response (first 500): %s", text[:500])
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return str(parsed.get("result") or parsed.get("response") or parsed)
     except Exception:
-        logger.exception("FATAL: Agent(...) construction failed (model=%r)", MODEL_ID)
-        raise
+        pass
+    return text
 
 
 @_app.entrypoint
-def invoke(payload):  # signature matches the AgentCore Strands sample exactly
-    """AgentCore Runtime HTTP entrypoint. Payload: {"prompt": "..."}."""
+def invoke(payload):
     logger.info("============ INVOKE CALLED ============")
     logger.info("INVOKE raw payload: %r (type=%s)", payload, type(payload).__name__)
     if not isinstance(payload, dict):
         try:
             payload = json.loads(payload) if isinstance(payload, (str, bytes, bytearray)) else dict(payload)
-            logger.info("INVOKE parsed payload to dict: %r", payload)
         except Exception:
             logger.exception("INVOKE could not coerce payload to dict")
             return {"error": f"unsupported payload type: {type(payload).__name__}"}
@@ -195,71 +193,63 @@ def invoke(payload):  # signature matches the AgentCore Strands sample exactly
     if not prompt:
         return {"error": "missing 'prompt' in payload"}
 
+    # Build the Registry MCP client per-invoke (its lifecycle is tied to a
+    # context manager, and Strands lazy-initialises tool connections inside
+    # the same scope as the Agent call).
     try:
-        agent = _build_agent()
+        mcp_factory = lambda: aws_iam_streamablehttp_client(  # noqa: E731
+            endpoint=REGISTRY_MCP_URL,
+            aws_region=REGION,
+            aws_service="bedrock-agentcore",
+        )
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.error("orchestrator build failure:\n%s", tb)
-        return {"error": f"orchestrator build failed: {type(e).__name__}: {e}", "trace": tb}
+        logger.exception("could not build MCP factory")
+        return {"error": f"mcp factory build failed: {type(e).__name__}: {e}"}
 
     try:
-        result = agent(prompt)
-        return {"result": str(result)}
+        with MCPClient(mcp_factory) as mcp_client:
+            mcp_tools = mcp_client.list_tools_sync()
+            logger.info("Registry MCP exposed %d tool(s): %s", len(mcp_tools), [getattr(t, "name", t) for t in mcp_tools])
+
+            agent = Agent(
+                name="orchestrator",
+                description="ユーザーのリクエストを適切なサブエージェントに振り分けるオーケストレーター。",
+                system_prompt=(
+                    "あなたはオーケストレーターエージェントです。あなた自身は処理を実行しません。\n"
+                    "Agent Registry の `search_registry_records` ツール（自然言語による検索）で"
+                    "リクエストに最も適したサブエージェントを探してください。\n"
+                    "filter で {\"descriptorType\": {\"$eq\": \"A2A\"}} を指定すると A2A サブエージェントだけに絞り込めます。\n"
+                    "見つかったレコードの `recordId` を使って `invoke_subagent(record_id, prompt)` を呼び、"
+                    "その回答をそのままユーザーに返してください。\n"
+                    "適切なサブエージェントが見つからない場合は、その旨を日本語で説明してください。"
+                ),
+                model=MODEL_ID,
+                tools=[*mcp_tools, invoke_subagent],
+                callback_handler=None,
+            )
+            logger.info("Agent built — invoking with prompt: %r", prompt)
+            result = agent(prompt)
+            return {"result": str(result)}
     except Exception as e:
         tb = traceback.format_exc()
         logger.error("orchestrator invoke failure:\n%s", tb)
-        return {"error": f"orchestrator invoke failed: {type(e).__name__}: {e}", "trace": tb}
+        return {
+            "error": f"orchestrator failed: {type(e).__name__}: {e}",
+            "trace": tb,
+        }
 
 
 if __name__ == "__main__":
-    # Use importlib.metadata for an accurate installed version, regardless of
-    # whether the package exposes __version__.
     try:
         from importlib.metadata import version as _pkg_version
         logger.info("bedrock-agentcore version: %s", _pkg_version("bedrock-agentcore"))
+        logger.info("mcp-proxy-for-aws version: %s", _pkg_version("mcp-proxy-for-aws"))
     except Exception:
-        logger.exception("could not read bedrock-agentcore version")
+        logger.exception("could not read package versions")
 
-    # Inspect the BedrockAgentCoreApp object so we can see what surface it
-    # actually exposes (routes, run signature, etc.) without needing the SDK
-    # docs handy.
-    try:
-        attrs = [a for a in dir(_app) if not a.startswith("_")]
-        logger.info("BedrockAgentCoreApp public attrs: %s", attrs)
-        import inspect
-        sig = inspect.signature(_app.run)
-        logger.info("_app.run signature: %s", sig)
-    except Exception:
-        logger.exception("could not introspect BedrockAgentCoreApp")
-
-    # Dump the actual routes registered on the app so we can see exactly
-    # where @entrypoint mapped our invoke function, and whether AgentCore's
-    # POST /invocations will hit it.
-    try:
-        for r in getattr(_app, "routes", []):
-            path = getattr(r, "path", "?")
-            methods = getattr(r, "methods", None)
-            endpoint = getattr(r, "endpoint", None)
-            endpoint_name = getattr(endpoint, "__qualname__", repr(endpoint))
-            logger.info("ROUTE %s %s -> %s", methods, path, endpoint_name)
-    except Exception:
-        logger.exception("could not list routes")
-
-    # Log any env vars AgentCore Runtime might inject for port/host.
-    relevant_env = {
-        k: v for k, v in os.environ.items()
-        if any(token in k.upper() for token in ("PORT", "HOST", "BEDROCK", "AGENT"))
-    }
-    logger.info("relevant env vars: %s", relevant_env)
-
-    # SDK 1.9 signature is _app.run(port, host=None, **kwargs). host=None
-    # means "let the SDK decide" — pass nothing and trust its default; only
-    # override via PORT/HOST env if you really need to.
     port = int(os.environ.get("PORT", "8080"))
-    host_override = os.environ.get("HOST")  # None unless explicitly set
-    logger.info(
-        "starting BedrockAgentCoreApp (port=%d, host_override=%r)", port, host_override
-    )
+    host_override = os.environ.get("HOST")
+    logger.info("starting BedrockAgentCoreApp (port=%d, host_override=%r)", port, host_override)
     try:
         if host_override:
             _app.run(port=port, host=host_override)

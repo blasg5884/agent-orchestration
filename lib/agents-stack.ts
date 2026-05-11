@@ -294,6 +294,9 @@ export class AgentsStack extends cdk.Stack {
               actions: [
                 'bedrock-agentcore:InvokeAgentRuntime',
                 'bedrock-agentcore:InvokeAgent',
+                // Registry MCP endpoint — required for the orchestrator's
+                // semantic search / tool listing path.
+                'bedrock-agentcore:InvokeRegistryMcp',
                 'bedrock-agentcore:SearchRegistryRecords',
                 'bedrock-agentcore:ListRegistryRecords',
                 'bedrock-agentcore:GetRegistryRecord',
