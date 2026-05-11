@@ -62,18 +62,40 @@ def _truthy(v: Any) -> bool:
 
 
 def _ensure_service_linked_role() -> None:
-    """Idempotently create the AgentCore service-linked role."""
+    """Idempotently create the AgentCore service-linked role.
+
+    Distinguish three cases so CloudWatch tells us what's really going on:
+      1. SLR newly created → wait for propagation.
+      2. SLR already exists → carry on.
+      3. Service name unrecognised or other failure → surface clearly.
+    """
     try:
-        _iam.create_service_linked_role(AWSServiceName=AGENTCORE_SLR_SERVICE_NAME)
-        logger.info("Created service-linked role for %s", AGENTCORE_SLR_SERVICE_NAME)
-        # Give IAM and AgentCore a moment to propagate the SLR.
-        time.sleep(15)
+        resp = _iam.create_service_linked_role(AWSServiceName=AGENTCORE_SLR_SERVICE_NAME)
+        arn = resp.get("Role", {}).get("Arn", "")
+        logger.info("SLR CREATED: %s for %s — sleeping 30s for propagation", arn, AGENTCORE_SLR_SERVICE_NAME)
+        time.sleep(30)
+        return
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
-        if "exists" in str(e).lower() or code in ("InvalidInput",):
-            logger.info("SLR already exists (or InvalidInput meaning exists) — continuing")
-        else:
-            logger.warning("create_service_linked_role error (continuing): %s", e)
+        msg = e.response.get("Error", {}).get("Message", "") or str(e)
+        logger.info("create_service_linked_role: code=%r msg=%r", code, msg)
+        msg_lc = msg.lower()
+        if "has been taken" in msg_lc or "already exists" in msg_lc or "alreadyexists" in code.lower():
+            logger.info("SLR already exists for %s — continuing", AGENTCORE_SLR_SERVICE_NAME)
+            return
+        if "does not exist" in msg_lc or "is not a valid" in msg_lc or "no such service" in msg_lc:
+            # Service name isn't recognised by IAM — AgentCore may not use an SLR
+            # in this region, or the service name is different. Continue and let
+            # create_registry surface a precise error.
+            logger.warning(
+                "IAM does not recognise SLR for %r; proceeding without SLR — "
+                "AgentCore may use a different mechanism in this region",
+                AGENTCORE_SLR_SERVICE_NAME,
+            )
+            return
+        # Any other error is unexpected; raise so we don't silently mis-provision.
+        logger.error("Unexpected SLR creation error: %s", e)
+        raise
 
 
 def _registry_exists(registry_id: str) -> bool:

@@ -72,14 +72,23 @@ export class RegistryStack extends cdk.Stack {
           'bedrock-agentcore:UpdateRegistry',
           'bedrock-agentcore:GetRegistry',
           'bedrock-agentcore:ListRegistries',
+          // Workload identity APIs — AgentCore creates one internally for
+          // each registry, and the calling principal needs these to be
+          // checked transitively (the workload-identity-creation failure
+          // surfaces as 'access was denied' from the registry's async
+          // provisioning).
+          'bedrock-agentcore:CreateWorkloadIdentity',
+          'bedrock-agentcore:DeleteWorkloadIdentity',
+          'bedrock-agentcore:GetWorkloadIdentity',
+          'bedrock-agentcore:UpdateWorkloadIdentity',
+          'bedrock-agentcore:ListWorkloadIdentities',
         ],
         resources: ['*'],
       }),
     );
-    // Needed so the Lambda can create the AgentCore service-linked role on
-    // first use. Without the SLR, AgentCore cannot create the registry's
-    // internal workload identity ("Unable to create workload identity because
-    // access was denied").
+    // SLR creation for the AgentCore service principal. Used opportunistically;
+    // the Lambda tolerates "service name unrecognised" if this region/preview
+    // doesn't expose an SLR.
     providerFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['iam:CreateServiceLinkedRole'],
