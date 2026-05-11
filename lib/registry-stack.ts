@@ -76,6 +76,18 @@ export class RegistryStack extends cdk.Stack {
         resources: ['*'],
       }),
     );
+    // Needed so the Lambda can create the AgentCore service-linked role on
+    // first use. Without the SLR, AgentCore cannot create the registry's
+    // internal workload identity ("Unable to create workload identity because
+    // access was denied").
+    providerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['iam:CreateServiceLinkedRole'],
+        resources: [
+          `arn:aws:iam::${cdk.Aws.ACCOUNT_ID}:role/aws-service-role/bedrock-agentcore.amazonaws.com/*`,
+        ],
+      }),
+    );
 
     const provider = new cr.Provider(this, 'RegistryProvider', {
       onEventHandler: providerFn,

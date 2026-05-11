@@ -126,6 +126,8 @@ export class AgentsStack extends cdk.Stack {
           'bedrock-agentcore:SubmitRegistryRecordForApproval',
           'bedrock-agentcore:UpdateRegistryRecordStatus',
           'bedrock-agentcore:ListRegistryRecords',
+          // The Lambda polls get_registry_record to wait for status transitions.
+          'bedrock-agentcore:GetRegistry',
         ],
         resources: ['*'],
       }),
