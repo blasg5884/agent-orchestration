@@ -21,12 +21,24 @@ export class ApiStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
 
+    // Both Lambdas bundle the latest boto3 because the Python 3.13 runtime ships
+    // a boto3 that lacks the Bedrock AgentCore preview methods (list_registry_records,
+    // search_registry_records, invoke_agent_runtime, ...).
+    const bundling: cdk.BundlingOptions = {
+      image: lambda.Runtime.PYTHON_3_13.bundlingImage,
+      command: [
+        'bash',
+        '-c',
+        'pip install -r requirements.txt -t /asset-output --no-cache-dir && cp -au . /asset-output',
+      ],
+    };
+
     const listAgentsFn = new lambda.Function(this, 'ListAgentsFn', {
       runtime: lambda.Runtime.PYTHON_3_13,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/list_agents')),
+      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/list_agents'), { bundling }),
       timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
+      memorySize: 512,
       environment: {
         AGENT_REGISTRY_ID: props.registryId,
         AGENT_REGISTRY_ARN: props.registryArn,
@@ -46,7 +58,7 @@ export class ApiStack extends cdk.Stack {
     const invokeFn = new lambda.Function(this, 'InvokeFn', {
       runtime: lambda.Runtime.PYTHON_3_13,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/invoke')),
+      code: lambda.Code.fromAsset(path.join(process.cwd(), 'lambda/invoke'), { bundling }),
       timeout: cdk.Duration.minutes(5),
       memorySize: 512,
       environment: {
