@@ -61,6 +61,11 @@ def handler(event: dict, _context: Any) -> dict:
             qualifier=ORCHESTRATOR_QUALIFIER,
             runtimeSessionId=session_id,
             payload=json.dumps({"prompt": prompt}).encode("utf-8"),
+            # Without this, AgentCore forwards application/octet-stream and
+            # the BedrockAgentCoreApp framework rejects/mis-parses the body
+            # before it ever reaches our @entrypoint.
+            contentType="application/json",
+            accept="application/json",
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("invoke_agent_runtime failed")

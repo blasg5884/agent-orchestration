@@ -60,6 +60,53 @@ _app = BedrockAgentCoreApp()
 _agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
 
 
+# Starlette/FastAPI-style middleware that logs every incoming HTTP request so
+# we can confirm whether AgentCore is actually reaching the container and
+# what content-type / shape it's sending.
+@_app.middleware("http")
+async def _log_requests(request, call_next):
+    try:
+        body = await request.body()
+    except Exception:
+        body = b"(could not read body)"
+    logger.info(
+        "HTTP %s %s ct=%r len=%d body=%r",
+        request.method,
+        request.url.path,
+        request.headers.get("content-type"),
+        len(body) if isinstance(body, (bytes, bytearray)) else -1,
+        body[:500] if isinstance(body, (bytes, bytearray)) else body,
+    )
+
+    async def _replay_receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+    # Re-inject the body because await request.body() consumes the stream.
+    request._receive = _replay_receive
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("middleware: unhandled exception during request")
+        raise
+    logger.info(
+        "HTTP %s %s -> %d",
+        request.method,
+        request.url.path,
+        getattr(response, "status_code", "?"),
+    )
+    return response
+
+
+@_app.exception_handler(Exception)
+async def _global_exception_handler(request, exc):
+    logger.exception("UNHANDLED exception during %s %s: %s", request.method, request.url.path, exc)
+    from starlette.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"error": f"{type(exc).__name__}: {exc}"},
+    )
+
+
 def _list_subagent_endpoints() -> list[str]:
     """Return A2A endpoint URLs from approved A2A records in the registry."""
     endpoints: list[str] = []
