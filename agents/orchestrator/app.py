@@ -34,10 +34,12 @@ _agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
 
 
 def _list_subagent_endpoints() -> list[str]:
-    """Search registry for AGENT-type approved records and return their A2A URLs.
+    """Search registry for A2A-type approved records and return their A2A URLs.
 
-    Each record's `descriptors.agent.card.inlineContent` holds the A2A Agent Card,
-    whose `url` field is the A2A endpoint to talk to.
+    Schema (control-plane create input mirrors the data-plane search output):
+      descriptorType: 'A2A'
+      descriptors.a2a.agentCard.inlineContent  → JSON A2A Agent Card
+    The card's `url` field is the A2A endpoint to talk to.
     """
     endpoints: list[str] = []
     paginator_kwargs: dict[str, Any] = {
@@ -47,10 +49,10 @@ def _list_subagent_endpoints() -> list[str]:
     }
     resp = _agentcore.search_registry_records(**paginator_kwargs)
     for rec in resp.get("registryRecords", []):
-        if rec.get("descriptorType") != "AGENT":
+        if rec.get("descriptorType") != "A2A":
             continue
         try:
-            card_str = rec["descriptors"]["agent"]["card"]["inlineContent"]
+            card_str = rec["descriptors"]["a2a"]["agentCard"]["inlineContent"]
             card = json.loads(card_str) if isinstance(card_str, str) else card_str
             url = card.get("url")
             if url:

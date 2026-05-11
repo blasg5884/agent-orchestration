@@ -1,20 +1,28 @@
 """Custom resource provider for Bedrock AgentCore Agent Registry.
 
-We bypass CDK's AwsCustomResource (JS) and use boto3 directly because:
+Schema verified against boto3 1.43.6 service model
+(botocore/data/bedrock-agentcore-control/2023-06-05/service-2.json):
 
-1. The preview API's response field names need to be observed at runtime —
-   we log the full response to CloudWatch so we can verify what's returned.
-2. AwsCustomResource serialises parameters into a JSON string in the CFn
-   template; cross-stack tokens may not always be resolved cleanly here.
-   Using cdk.CustomResource + our own Lambda passes properties through
-   the standard CFn custom-resource ResourceProperties contract, which
-   CloudFormation always fully resolves before invoking the Lambda.
+  CreateRegistry input:
+    name*               RegistryName pattern [a-zA-Z0-9][a-zA-Z0-9_\\-\\.\\/]*
+    description         Description
+    authorizerType      enum ['CUSTOM_JWT', 'AWS_IAM']
+    authorizerConfiguration  structure (only required for CUSTOM_JWT)
+    clientToken         ClientToken
+    approvalConfiguration    structure { autoApproval: bool }
+  CreateRegistry output:
+    registryArn*        arn:aws...:registry/[a-zA-Z0-9]{12,16}
+    (NOTE: registryId is NOT returned — must be extracted from the ARN)
+
+  DeleteRegistry input:
+    registryId*         (arn:aws...:registry/)?[a-zA-Z0-9]{12,16}
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import boto3
@@ -25,6 +33,15 @@ logger.setLevel(logging.INFO)
 
 REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 _client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+
+# Matches the trailing segment of a registry ARN: ".../registry/<id>"
+_REGISTRY_ID_FROM_ARN = re.compile(r":registry/([a-zA-Z0-9]{12,16})$")
+
+
+def _extract_registry_id(arn: str) -> str:
+    """Pull the short registry ID out of the ARN suffix."""
+    m = _REGISTRY_ID_FROM_ARN.search(arn or "")
+    return m.group(1) if m else ""
 
 
 def _truthy(v: Any) -> bool:
@@ -37,27 +54,26 @@ def handler(event: dict, _context: Any) -> dict:
     props: dict = event.get("ResourceProperties", {}) or {}
 
     if req == "Create":
-        # Parameter shape per the preview boto3 model (validated against the
-        # service via "Unknown parameter" errors):
-        #   name, description, authorizerType, authorizerConfiguration,
-        #   clientToken, approvalConfiguration
         resp = _client.create_registry(
             name=props["name"],
             description=props.get("description", ""),
-            authorizerType="IAM",
+            authorizerType="AWS_IAM",
             approvalConfiguration={
-                "autoApprovalEnabled": _truthy(props.get("autoApprove", "true")),
+                "autoApproval": _truthy(props.get("autoApprove", "true")),
             },
         )
         logger.info("CREATE_REGISTRY RESPONSE: %s", json.dumps(resp, default=str))
 
-        registry_id = resp.get("registryId") or ""
         registry_arn = resp.get("registryArn") or ""
-        # PhysicalResourceId must be non-empty and stable. Use registryId if
-        # present, else registryArn, else the registry name (which we control).
-        physical_id = registry_id or registry_arn or props["name"]
+        registry_id = _extract_registry_id(registry_arn)
+        if not registry_id:
+            raise RuntimeError(
+                f"could not extract registryId from arn={registry_arn!r}"
+            )
+        logger.info("Extracted registryId=%r from registryArn=%r", registry_id, registry_arn)
+
         return {
-            "PhysicalResourceId": physical_id,
+            "PhysicalResourceId": registry_id,
             "Data": {
                 "registryId": registry_id,
                 "registryArn": registry_arn,
@@ -66,27 +82,24 @@ def handler(event: dict, _context: Any) -> dict:
         }
 
     if req == "Update":
-        # Registries are effectively immutable in this prototype; return the
-        # existing physical resource ID so CloudFormation considers it unchanged.
-        old_props = event.get("OldResourceProperties", {}) or {}
+        # Registries are effectively immutable in this prototype — return existing.
         return {
             "PhysicalResourceId": event["PhysicalResourceId"],
             "Data": {
                 "registryId": event["PhysicalResourceId"],
-                "registryArn": old_props.get("_existingArn", ""),
-                "name": props.get("name", old_props.get("name", "")),
+                "registryArn": props.get("_existingArn", ""),
+                "name": props.get("name", ""),
             },
         }
 
     if req == "Delete":
-        physical_id = event["PhysicalResourceId"]
+        registry_id = event["PhysicalResourceId"]
         try:
-            _client.delete_registry(registryId=physical_id)
-            logger.info("delete_registry succeeded for %s", physical_id)
+            _client.delete_registry(registryId=registry_id)
+            logger.info("delete_registry succeeded for %s", registry_id)
         except ClientError as e:
-            # Don't fail stack rollback on delete errors (registry might already
-            # be gone, or the physical id might be a fallback value).
+            # Don't block stack rollback on delete failures.
             logger.warning("delete_registry failed (continuing): %s", e)
-        return {"PhysicalResourceId": physical_id}
+        return {"PhysicalResourceId": registry_id}
 
     raise ValueError(f"unknown request type: {req}")
