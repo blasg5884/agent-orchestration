@@ -153,5 +153,20 @@ def invoke(payload: dict, context: Any = None) -> dict:  # noqa: ARG001
 
 
 if __name__ == "__main__":
-    logger.info("starting BedrockAgentCoreApp on default port")
-    _app.run()
+    # Surface SDK version + the actual bind config so we can verify it
+    # matches what AgentCore Runtime is contacting (HTTP protocol = port 8080).
+    try:
+        import bedrock_agentcore as _bac
+        logger.info("bedrock_agentcore version: %s", getattr(_bac, "__version__", "unknown"))
+    except Exception:
+        logger.exception("could not read bedrock_agentcore version")
+
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8080"))
+    logger.info("starting BedrockAgentCoreApp on %s:%d", host, port)
+    try:
+        _app.run(host=host, port=port)
+    except TypeError:
+        # Older SDK signatures may not accept host/port — fall back.
+        logger.warning("_app.run(host, port) signature rejected; falling back to _app.run()")
+        _app.run()
