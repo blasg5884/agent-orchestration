@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as path from 'path';
 import { Construct } from 'constructs';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as ecrAssets from 'aws-cdk-lib/aws-ecr-assets';
 import * as bedrockagentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import { RegistryRecord } from './registry-record';
@@ -9,6 +10,13 @@ import { RegistryRecord } from './registry-record';
 export interface AgentsStackProps extends cdk.StackProps {
   readonly registryId: string;
   readonly registryArn: string;
+  /**
+   * SSM Parameter Store path created by RegistryStack that holds the registry ARN.
+   * Used for AwsCustomResource parameters where CDK cross-stack tokens may not
+   * resolve correctly. CloudFormation resolves SSM dynamic references before Lambda
+   * invocation, so the Lambda always receives the actual ARN string.
+   */
+  readonly registryArnSsmParamName: string;
 }
 
 interface SubAgentSpec {
@@ -70,6 +78,15 @@ export class AgentsStack extends cdk.Stack {
 
     const runtimeRole = this.createRuntimeRole();
 
+    // Resolve the registry ARN via SSM dynamic reference.
+    // CloudFormation resolves {{resolve:ssm:/...}} before invoking any Lambda, so
+    // AwsCustomResource parameters receive the actual ARN string rather than a
+    // CDK cross-stack CFn token (which can remain unresolved inside Custom Resource params).
+    const registryArnFromSsm = ssm.StringParameter.valueForStringParameter(
+      this,
+      props.registryArnSsmParamName,
+    );
+
     // --- Sub-agents (A2A) ---
     const subAgentEndpoints: { spec: SubAgentSpec; runtime: bedrockagentcore.CfnRuntime }[] = [];
     for (const spec of SUBAGENTS) {
@@ -113,7 +130,7 @@ export class AgentsStack extends cdk.Stack {
         })),
       };
       new RegistryRecord(this, `${spec.key}Record`, {
-        registryArn: props.registryArn,
+        registryArn: registryArnFromSsm,
         name: spec.runtimeName,
         description: spec.description,
         recordVersion: '1.0.0',

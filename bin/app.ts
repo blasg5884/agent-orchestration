@@ -23,6 +23,7 @@ const agentsStack = new AgentsStack(app, 'AgentOrchestrationAgentsStack', {
   env,
   registryId: registryStack.registryId,
   registryArn: registryStack.registryArn,
+  registryArnSsmParamName: registryStack.registryArnSsmParamName,
 });
 agentsStack.addDependency(registryStack);
 

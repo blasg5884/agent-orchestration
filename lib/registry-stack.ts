@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import {
   AwsCustomResource,
   AwsCustomResourcePolicy,
@@ -28,6 +29,12 @@ export class RegistryStack extends cdk.Stack {
   public readonly registryId: string;
   public readonly registryArn: string;
   public readonly autoApprove: boolean;
+  /**
+   * SSM Parameter Store path that holds the registry ARN.
+   * Pass this to AgentsStack so it can resolve the ARN via SSM dynamic reference,
+   * avoiding cross-stack CFn token issues inside AwsCustomResource parameters.
+   */
+  public readonly registryArnSsmParamName: string;
 
   constructor(scope: Construct, id: string, props: RegistryStackProps) {
     super(scope, id, props);
@@ -78,6 +85,16 @@ export class RegistryStack extends cdk.Stack {
 
     this.registryId = registry.getResponseField('registryId');
     this.registryArn = registry.getResponseField('registryArn');
+
+    // Store the registry ARN in SSM so AgentsStack can retrieve it via SSM dynamic
+    // reference ({{resolve:ssm:/...}}), which CloudFormation resolves before invoking
+    // any Lambda — avoiding CDK cross-stack token issues inside AwsCustomResource params.
+    this.registryArnSsmParamName = '/agent-orchestration/registry-arn';
+    new ssm.StringParameter(this, 'RegistryArnParam', {
+      parameterName: this.registryArnSsmParamName,
+      stringValue: this.registryArn,
+      description: 'AgentCore Agent Registry ARN for cross-stack reference',
+    });
 
     new cdk.CfnOutput(this, 'RegistryId', { value: this.registryId });
     new cdk.CfnOutput(this, 'RegistryArn', { value: this.registryArn });
