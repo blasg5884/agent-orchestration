@@ -221,7 +221,7 @@ export class AgentsStack extends cdk.Stack {
         // Set ORCHESTRATOR_MODEL_ID in your shell before `cdk deploy` to
         // pin a specific Bedrock model (e.g. one you have access to).
         ORCHESTRATOR_MODEL_ID:
-          process.env.ORCHESTRATOR_MODEL_ID ?? 'apac.anthropic.claude-sonnet-4-20250514-v1:0',
+          process.env.ORCHESTRATOR_MODEL_ID ?? 'global.anthropic.claude-sonnet-4-6',
       },
     });
     orchestrator.addDependency(runtimeRole.node.defaultChild as cdk.CfnResource);

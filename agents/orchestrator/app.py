@@ -43,10 +43,10 @@ REGISTRY_ID = os.environ.get("AGENT_REGISTRY_ID", "")
 REGISTRY_ARN = os.environ.get("AGENT_REGISTRY_ARN", "")
 MODEL_ID = os.environ.get(
     "ORCHESTRATOR_MODEL_ID",
-    # APAC cross-region inference profile for Claude Sonnet 4 — broadly
-    # available in ap-northeast-1. Override with ORCHESTRATOR_MODEL_ID env var
-    # if you have a different model enabled in Bedrock.
-    "apac.anthropic.claude-sonnet-4-20250514-v1:0",
+    # Global cross-region inference profile for Claude Sonnet 4.6.
+    # Override with ORCHESTRATOR_MODEL_ID env var if you have a different
+    # model enabled in Bedrock.
+    "global.anthropic.claude-sonnet-4-6",
 )
 REGISTRY_MCP_URL = (
     f"https://bedrock-agentcore.{REGION}.amazonaws.com/registry/{REGISTRY_ID}/mcp"

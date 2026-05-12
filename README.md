@@ -123,7 +123,7 @@ curl -X POST "$API_URL/v1/invoke" \
 - AWS CLI 認証情報が東京リージョン向けに設定済み
 - Docker が稼働している（CDK の `DockerImageAsset` が `linux/arm64` で AgentCore 用イメージをビルド）
 - Agent Registry プレビュー API のため、Custom Resource Lambda は `installLatestAwsSdk: true` で最新 boto3 (≥ 1.42.91) を取得
-- Bedrock のモデル `apac.anthropic.claude-sonnet-4-5-20250929-v1:0`（または任意の代替）が東京リージョンで有効化済み
+- Bedrock のモデル `global.anthropic.claude-sonnet-4-6`（または `ORCHESTRATOR_MODEL_ID` env で指定する任意の代替）が東京リージョンで利用可能であること
 
 ```bash
 # 依存インストール
