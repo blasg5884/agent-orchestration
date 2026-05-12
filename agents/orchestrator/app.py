@@ -133,6 +133,66 @@ def _resolve_runtime_arn_for_record(record_id: str) -> str:
     return url
 
 
+def _build_a2a_send_message_request(prompt: str) -> dict:
+    """Construct an A2A protocol JSON-RPC 2.0 `message/send` request body.
+
+    Sub-agents run a Strands A2AServer (a2a-sdk JSON-RPC server) which
+    rejects raw payloads — its JSONRPCRequest validator requires the
+    standard {jsonrpc, id, method, params} envelope. The `message/send`
+    method's params shape is documented by the A2A spec:
+      params.message: { kind: 'message', messageId, role, parts: [{kind:'text',text}] }
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": {
+            "message": {
+                "kind": "message",
+                "messageId": str(uuid.uuid4()),
+                "role": "user",
+                "parts": [{"kind": "text", "text": prompt}],
+            }
+        },
+    }
+
+
+def _extract_text_from_a2a_response(parsed: dict) -> str:
+    """Pull the agent's textual reply out of an A2A JSON-RPC response.
+
+    The `result` field can either be a `Task` object (with `artifacts` /
+    `status.message`) or a `Message` object directly. We try the most
+    common shapes and fall back to a JSON dump.
+    """
+    if "error" in parsed:
+        return f"A2A error: {parsed['error']}"
+    result = parsed.get("result") or {}
+
+    # Direct Message result.
+    parts = result.get("parts")
+    if parts:
+        return "".join(p.get("text", "") for p in parts if p.get("kind") == "text")
+
+    # Task result: status.message.parts
+    status = result.get("status") or {}
+    status_msg = status.get("message") or {}
+    parts = status_msg.get("parts")
+    if parts:
+        return "".join(p.get("text", "") for p in parts if p.get("kind") == "text")
+
+    # Task result: artifacts[*].parts[*].text
+    artifacts = result.get("artifacts") or []
+    pieces: list[str] = []
+    for art in artifacts:
+        for p in art.get("parts", []) or []:
+            if p.get("kind") == "text" and p.get("text"):
+                pieces.append(p["text"])
+    if pieces:
+        return "\n".join(pieces)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
 @tool
 def invoke_subagent(record_id: str, prompt: str) -> str:
     """Invoke a sub-agent (registered in the Agent Registry) by its record id.
@@ -153,13 +213,17 @@ def invoke_subagent(record_id: str, prompt: str) -> str:
         return f"failed to resolve sub-agent: {type(e).__name__}: {e}"
 
     session_id = _make_session_id()
-    logger.info("invoke_subagent dispatching to %s session=%s", runtime_arn, session_id)
+    a2a_request = _build_a2a_send_message_request(prompt)
+    logger.info(
+        "invoke_subagent dispatching to %s session=%s a2a_id=%s",
+        runtime_arn, session_id, a2a_request["id"],
+    )
     try:
         resp = _agentcore.invoke_agent_runtime(
             agentRuntimeArn=runtime_arn,
             qualifier="DEFAULT",
             runtimeSessionId=session_id,
-            payload=json.dumps({"prompt": prompt}).encode("utf-8"),
+            payload=json.dumps(a2a_request).encode("utf-8"),
             contentType="application/json",
             accept="application/json",
         )
@@ -172,11 +236,11 @@ def invoke_subagent(record_id: str, prompt: str) -> str:
     logger.info("invoke_subagent response (first 500): %s", text[:500])
     try:
         parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return str(parsed.get("result") or parsed.get("response") or parsed)
-    except Exception:
-        pass
-    return text
+    except json.JSONDecodeError:
+        return text
+    if not isinstance(parsed, dict):
+        return text
+    return _extract_text_from_a2a_response(parsed)
 
 
 @_app.entrypoint
